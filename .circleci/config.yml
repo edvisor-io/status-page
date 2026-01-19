@@ -3,11 +3,64 @@ version: 2.1
 orbs:
   node: circleci/node@5
   aws-cli: circleci/aws-cli@4.0
+  aws-s3: circleci/aws-s3@4.0.0
+  slack: circleci/slack@4.10.1
 
 executors:
   node-executor:
     docker:
       - image: cimg/node:20.11
+
+commands:
+  notify-failure:
+    parameters:
+      title:
+        type: string
+      description:
+        type: string
+      channel:
+        type: string
+        default: 'deployment-update'
+    steps:
+      - slack/notify:
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "<< parameters.title >> - status-page"
+                  }
+                },
+                {
+                  "type": "divider"
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":warning: << parameters.description >>"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [{
+                    "type": "button",
+                    "text": {
+                      "type": "plain_text",
+                      "text": "View build pipeline",
+                      "emoji": true
+                    },
+                    "value": "View build pipeline",
+                    "url": "https://app.circleci.com/pipelines/github/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}/<<pipeline.number>>/workflows/${CIRCLE_WORKFLOW_ID}",
+                    "action_id": "button-action"
+                  }]
+                }
+              ]
+            }
+          event: fail
+          channel: << parameters.channel >>
 
 jobs:
   build:
@@ -28,23 +81,46 @@ jobs:
             - dist
 
   deploy:
-    executor: node-executor
+    docker:
+      - image: cimg/node:20.11
     steps:
       - attach_workspace:
           at: .
-      - aws-cli/setup
-      - run:
-          name: Deploy to S3
-          command: |
-            aws s3 sync dist/ s3://status-edvisor-io-static \
-              --delete \
-              --cache-control "max-age=60"
+      - aws-cli/setup:
+          profile-name: default
+      # Sync static assets (JS, CSS, images) with long cache
+      - aws-s3/sync:
+          arguments: |
+            --exclude "*.json" --exclude "*.html" --cache-control max-age=31536000
+          from: dist
+          to: s3://${S3_BUCKET_NAME}
+      # Sync JSON data files with short cache (1 minute)
+      - aws-s3/sync:
+          arguments: |
+            --exclude "*" --include "*.json" --cache-control max-age=60,s-maxage=60
+          from: dist
+          to: s3://${S3_BUCKET_NAME}
+      # Sync HTML with no-cache for immediate updates
+      - aws-s3/sync:
+          arguments: |
+            --exclude "*" --include "*.html" --cache-control no-cache,no-store,must-revalidate
+          from: dist
+          to: s3://${S3_BUCKET_NAME}
+      - notify-failure:
+          title: 'Deployment Failed'
+          description: 'Status page deployment to S3 failed. Please investigate.'
+
+  invalidate-distribution:
+    docker:
+      - image: cimg/aws:2024.03
+    steps:
       - run:
           name: Invalidate CloudFront cache
           command: |
-            aws cloudfront create-invalidation \
-              --distribution-id ${CLOUDFRONT_DISTRIBUTION_ID} \
-              --paths "/*"
+            aws cloudfront create-invalidation --distribution-id ${CLOUDFRONT_DISTRIBUTION_ID} --paths '/*'
+      - notify-failure:
+          title: 'Cache Invalidation Failed'
+          description: 'CloudFront cache invalidation failed. Please investigate.'
 
 workflows:
   build-and-deploy:
@@ -57,4 +133,12 @@ workflows:
             branches:
               only: main
           context:
-            - aws-production
+            - org-global
+      - invalidate-distribution:
+          requires:
+            - deploy
+          filters:
+            branches:
+              only: main
+          context:
+            - org-global
