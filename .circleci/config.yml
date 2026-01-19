@@ -1,0 +1,60 @@
+version: 2.1
+
+orbs:
+  node: circleci/node@5
+  aws-cli: circleci/aws-cli@4.0
+
+executors:
+  node-executor:
+    docker:
+      - image: cimg/node:20.11
+
+jobs:
+  build:
+    executor: node-executor
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: npm
+      - run:
+          name: Run linter
+          command: npm run lint
+      - run:
+          name: Build static site
+          command: npm run build
+      - persist_to_workspace:
+          root: .
+          paths:
+            - dist
+
+  deploy:
+    executor: node-executor
+    steps:
+      - attach_workspace:
+          at: .
+      - aws-cli/setup
+      - run:
+          name: Deploy to S3
+          command: |
+            aws s3 sync dist/ s3://status-edvisor-io-static \
+              --delete \
+              --cache-control "max-age=60"
+      - run:
+          name: Invalidate CloudFront cache
+          command: |
+            aws cloudfront create-invalidation \
+              --distribution-id ${CLOUDFRONT_DISTRIBUTION_ID} \
+              --paths "/*"
+
+workflows:
+  build-and-deploy:
+    jobs:
+      - build
+      - deploy:
+          requires:
+            - build
+          filters:
+            branches:
+              only: main
+          context:
+            - aws-production
